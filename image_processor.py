@@ -33,7 +33,8 @@ yolo_model = YOLO("yolov8n.pt")
 # 1. Frame Extraction
 # -----------------------------
 
-def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=None, resize=(224, 224)):
+def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=None, resize=(224, 224), Sample_dir=None, save_clip=False, save_keyframes=False):
+    """Extract frames from video at specified sample rate and time range."""
     cap = cv2.VideoCapture(video_path)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -55,6 +56,23 @@ def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=Non
     frames = []
     frame_indices = []
 
+    writer = None
+
+    if save_clip:
+
+        clip_output_path = os.path.join(Sample_dir, f"clip_{timestamp:.2f}s_to_{next_timestamp:.2f}s.mp4")
+
+        os.makedirs(os.path.dirname(clip_output_path), exist_ok=True)
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+        writer = cv2.VideoWriter(
+            clip_output_path,
+            fourcc,
+            fps,
+            resize
+        )
+
     # IMPORTANT: jump directly to start frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
@@ -65,6 +83,14 @@ def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=Non
 
         if not ret:
             break
+        
+        resized_frame = cv2.resize(frame, resize)
+
+        # -----------------------------------
+        # Save clip frame
+        # -----------------------------------
+        if writer is not None:
+            writer.write(resized_frame)
 
         if (frame_idx - start_frame) % frame_interval == 0:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -72,9 +98,23 @@ def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=Non
             frames.append(frame)
             frame_indices.append(frame_idx)
 
+            if save_keyframes:
+                keyframe_dir = os.path.join(Sample_dir, "keyframes")
+                os.makedirs(keyframe_dir, exist_ok=True)
+                timestamp_sec = frame_idx / fps
+                filename = (
+                f"frame_{frame_idx}_"
+                f"{timestamp_sec:.2f}s.jpg"
+                                )
+                save_path = os.path.join(keyframe_dir, filename)
+                cv2.imwrite(save_path, resized_frame)
+
         frame_idx += 1
 
     cap.release()
+
+    if writer is not None:
+        writer.release()
 
     return np.array(frames), frame_indices
 
@@ -83,7 +123,7 @@ def extract_frames(video_path, sample_rate=2, timestamp=None, next_timestamp=Non
 # 2. RGB Embeddings: DINOv2
 # -----------------------------
 
-def extract_rgb_embeddings(frames):
+def extract_rgb_embeddings(frames, Feature_dir=None):
     """
     Returns DINOv2 CLS embeddings.
     Shape: [num_frames, 768]
@@ -105,6 +145,8 @@ def extract_rgb_embeddings(frames):
             embeddings.append(
                 cls_embedding.squeeze(0).cpu().numpy()
             )
+    # saving numpy array of embeddings to disk for debugging
+    np.save(os.path.join(Feature_dir, "rgb_embeddings.npy"), np.array(embeddings))
 
     return np.array(embeddings)
 
@@ -113,7 +155,7 @@ def extract_rgb_embeddings(frames):
 # 3. Optical Flow Features
 # -----------------------------
 
-def extract_optical_flow_features(frames):
+def extract_optical_flow_features(frames, Feature_dir=None):
     """
     Extract compact optical flow statistics.
     Shape: [num_frames, 4]
@@ -166,6 +208,9 @@ def extract_optical_flow_features(frames):
         flow_features.append(features)
 
         prev_gray = curr_gray
+    
+    # saving numpy array of flow features to disk for debugging
+    np.save(os.path.join(Feature_dir, "flow_features.npy"), np.array(flow_features))
 
     return np.array(flow_features)
 
@@ -235,7 +280,7 @@ def extract_audio_mfcc_features(video_path, target_length):
 # 5. Object Detection Features
 # -----------------------------
 
-def extract_object_features(frames, max_objects=10):
+def extract_object_features(frames, Sample_dir=None, save_detected_frames=False, max_objects=10):
     """
     Extract compact object features per frame.
 
@@ -247,50 +292,130 @@ def extract_object_features(frames, max_objects=10):
 
     Output shape: [num_frames, 4]
     """
+    output_dir = os.path.join(Sample_dir, "detected_frames")
+
+    if save_detected_frames:
+        os.makedirs(output_dir, exist_ok=True)
 
     object_features = []
 
-    for frame in tqdm(frames, desc="Extracting object features"):
+    for i, frame in enumerate(tqdm(frames, desc="Extracting object features")):
         results = yolo_model(frame, verbose=False)
 
         boxes = results[0].boxes
 
         if boxes is None or len(boxes) == 0:
-            object_features.append(np.zeros(4))
+            num_classes = len(yolo_model.names)
+            feature_dim = 4 + num_classes
+
+            object_features.append(np.zeros(feature_dim))
+
+            if save_detected_frames:
+                save_path = os.path.join(output_dir, f"frame_{i:04d}_no_objects.jpg")
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(save_path, frame_bgr)
+
             continue
 
         confidences = boxes.conf.cpu().numpy()
         xyxy = boxes.xyxy.cpu().numpy()
+        class_ids = boxes.cls.cpu().numpy().astype(int)
+
+        # -----------------------------------
+        # Confidence filtering
+        # -----------------------------------
+        confidence_threshold = 0.5
+
+        valid_indices = confidences >= confidence_threshold
+
+        confidences = confidences[valid_indices]
+        xyxy = xyxy[valid_indices]
+        class_ids = class_ids[valid_indices]
+
+        if len(confidences) == 0:
+            num_classes = len(yolo_model.names)
+            feature_dim = 4 + num_classes
+
+            object_features.append(np.zeros(feature_dim))
+
+            continue
+
+        class_hist = np.zeros(len(yolo_model.names))
+
+        for cls_id in class_ids:
+            class_hist[cls_id] += 1
+
+        class_hist = class_hist / max_objects
 
         areas = []
 
-        for box in xyxy:
+        # Copy frame for drawing
+        plotted_frame = frame.copy()
+
+        for box, conf, cls_id in zip(xyxy, confidences, class_ids):
             x1, y1, x2, y2 = box
+            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
             area = max((x2 - x1), 0) * max((y2 - y1), 0)
             areas.append(area)
+
+            class_name = yolo_model.names[cls_id]
+            label = f"{class_name} {conf:.2f}"
+
+            cv2.rectangle(
+                plotted_frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                plotted_frame,
+                label,
+                (x1, max(y1 - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                2
+            )
 
         areas = np.array(areas)
 
         frame_area = frame.shape[0] * frame.shape[1]
 
-        features = np.array([
-            len(boxes),
-            np.mean(confidences),
-            np.max(areas) / frame_area,
-            len(boxes) / max_objects
+        features = np.concatenate([
+            np.array([
+                len(boxes),
+                np.mean(confidences),
+                np.max(areas) / frame_area,
+                len(boxes) / max_objects
+            ]),
+            class_hist
         ])
 
         object_features.append(features)
 
-    return np.array(object_features)
+        if save_detected_frames:
+            save_path = os.path.join(output_dir, f"frame_{i:04d}_detections.jpg")
+
+            # Convert RGB to BGR before saving with OpenCV
+            plotted_frame_bgr = cv2.cvtColor(plotted_frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(save_path, plotted_frame_bgr)
+
+    os.makedirs(os.path.join(Sample_dir, "Features"), exist_ok=True)
+
+    # saving numpy array of object features to disk for debugging
+    np.save(os.path.join(Sample_dir, "Features/object_features.npy"), np.array(object_features))
+
+    return np.stack(object_features)
 
 
 # -----------------------------
 # 6. Temporal Consistency Features
 # -----------------------------
 
-def extract_temporal_consistency_features(rgb_embeddings):
+def extract_temporal_consistency_features(rgb_embeddings, Feature_dir=None):
     """
     Measures frame-to-frame feature change.
 
@@ -325,6 +450,8 @@ def extract_temporal_consistency_features(rgb_embeddings):
                 change_magnitude
             ])
         )
+    # saving numpy array of temporal features to disk for debugging
+    np.save(os.path.join(Feature_dir, "temporal_features.npy"), np.array(temporal_features))
 
     return np.array(temporal_features)
 
@@ -411,7 +538,7 @@ def merge_tier1_features(
 # 8. Complete Single Video Pipeline
 # -----------------------------
 
-def process_single_video(video_path, output_path, timestamp, next_timestamp, sample_rate=2):
+def process_single_video(video_path, output_path, timestamp, next_timestamp, sample_rate=2, Sample_dir=None):
     """
     Extract and merge Tier-1 features from a single video.
     """
@@ -422,26 +549,33 @@ def process_single_video(video_path, output_path, timestamp, next_timestamp, sam
         video_path,
         sample_rate=sample_rate,
         timestamp=timestamp,
-        next_timestamp=next_timestamp
+        next_timestamp=next_timestamp,
+        resize=(224, 224),
+        Sample_dir=Sample_dir,
+        save_clip=True, 
+        save_keyframes=True
     )
 
     if len(frames) == 0:
         print("No frames extracted.")
         return None
+    
+    Feature_dir = os.path.join(Sample_dir, "Features")
+    os.makedirs(Feature_dir, exist_ok=True)
 
-    rgb_embeddings = extract_rgb_embeddings(frames)
+    rgb_embeddings = extract_rgb_embeddings(frames, Feature_dir=Feature_dir)
 
-    flow_features = extract_optical_flow_features(frames)
+    flow_features = extract_optical_flow_features(frames, Feature_dir=Feature_dir)
 
     # audio_features = extract_audio_mfcc_features(
     #     video_path,
     #     target_length=len(frames)
     # )
 
-    object_features = extract_object_features(frames)
+    object_features = extract_object_features(frames, Sample_dir=Sample_dir, save_detected_frames=True)
 
     temporal_features = extract_temporal_consistency_features(
-        rgb_embeddings
+        rgb_embeddings, Feature_dir=Feature_dir
     )
 
     merged_features = merge_tier1_features(
